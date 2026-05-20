@@ -71,7 +71,7 @@
 
 ### 4.4. Надёжность и отказоустойчивость (Reliability)
 * Гарантия отсутствия потери данных (At-least-once доставка) об изменениях каталога.
-* Идемпотентность обработчиков событий: система должна корректно переваривать дубли событий изменения товара или приход событий в нарушенном порядке (использование поля `version` или `updated_at` для защиты от перезаписи свежих данных старыми).
+* Идемпотентность обработчиков событий: система должна корректно переваривать дубли событий изменения товара или приход событий в нарушенном порядке (использование поля version на основе монотонно возрастающего счетчика Sequence из БД для защиты от перезаписи свежих данных старыми).
 * Доступность API поиска (SLA): 99.99%.
 
 ### 4.5. Масштабируемость (Scalability)
@@ -110,13 +110,13 @@
 
 ## 6. Модель данных (Data Model)
 
-Для обеспечения требуемой производительности (P95 < 200 мс на 50 000 RPS) использование классической реляционной базы данных (PostgreSQL/MySQL) с большим количеством `JOIN` неэффективно. Данные в поисковом движке (например, OpenSearch/Elasticsearch) хранятся в максимально **денормализованном виде** (плоские документы).
+Для обеспечения требуемой производительности (P95 < 200 мс на 50 000 RPS) использование классической реляционной базы данных с большим количеством `JOIN` неэффективно. В то время как основная БД Каталога спроектирована в строго нормализованном виде для обеспечения транзакционной целостности, данные в поисковом движке (например, OpenSearch/Elasticsearch) хранятся в максимально **денормализованном виде** (плоские документы).
 
 ### 6.1. Транзакционная модель vs Поисковый индекс
 
 ```mermaid
 erDiagram
-    %% Master Catalog (Relational)
+    %% Master Catalog (Normalized Relational)
     PRODUCT {
         bigint id PK
         varchar title
@@ -124,24 +124,26 @@ erDiagram
         int category_id FK
         int brand_id FK
         boolean is_active
-        timestamp updated_at
+        bigint version "Значение глобального SEQUENCE на момент изменения"
     }
     
     INVENTORY {
         bigint product_id PK, FK
         int stock_quantity
+        bigint version "Значение глобального SEQUENCE на момент изменения"
     }
     
     PRICE {
         bigint product_id PK, FK
         decimal base_price
         decimal discount_price
+        bigint version "Значение глобального SEQUENCE на момент изменения"
     }
 
     PRODUCT ||--o| INVENTORY : "has"
     PRODUCT ||--o| PRICE : "has"
 
-    %% Search Index (Document)
+    %% Search Index (Denormalized Document)
     SEARCH_DOCUMENT {
         string product_id "PK (Document ID)"
         string title "Analyzed for full-text"
@@ -154,7 +156,7 @@ erDiagram
         long version "Монотонно возрастающий счетчик (PostgreSQL Sequence) для защиты от race conditions"
     }
     
-    PRODUCT }o..o{ SEARCH_DOCUMENT : "Denormalized via CDC into"
+    PRODUCT }o..o{ SEARCH_DOCUMENT : "Sync via CDC & Partial Updates"
 ```
 
 ### 6.2. Особенности хранения в поисковом индексе
@@ -314,7 +316,7 @@ sequenceDiagram
 
 **Особенности реализации (Сборка документа и Partial Updates):**
 
-* **Частичные обновления (Partial Updates):** Так как Каталог товаров нормализован (таблицы Product, Inventory, Price независимы), Debezium генерирует разрозненные события (diff) по конкретным строкам. Чтобы `Indexer Service` не совершал тяжелых запросов в мастер-БД для полной сборки JSON-документа, используется API частичныхновлений OpenSearch (`_update` API). 
+* **Частичные обновления (Partial Updates):** Так как Каталог товаров нормализован (таблицы Product, Inventory, Price независимы), Debezium генерирует разрозненные события (diff) по конкретным строкам. Чтобы `Indexer Service` не совершал тяжелых запросов в мастер-БД для полной сборки JSON-документа, используется API частичных обновлений OpenSearch (`_update` API). 
   * Если пришло событие об изменении цены из таблицы `PRICE`, Indexer отправляет точечный патч: `{ "doc": { "price": new_price } }`.
   * Если изменился остаток в `INVENTORY`, отправляется патч: `{ "doc": { "in_stock": true/false } }`.
 
